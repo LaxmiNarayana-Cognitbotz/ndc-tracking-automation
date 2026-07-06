@@ -1,18 +1,20 @@
 """
-SharePoint File Upload Script
+SharePoint File Upload Script using Microsoft Graph API
 """
 
 import argparse
+import asyncio
 import os
 import sys
 import traceback
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Tuple
 
 from dotenv import load_dotenv
-from office365.runtime.auth.authentication_context import AuthenticationContext
-from office365.runtime.client_request_exception import ClientRequestException
-from office365.sharepoint.client_context import ClientContext
+import httpx
+import msal
 
 # Redirect stdout and stderr to a log file
 LOG_DIR = Path(__file__).parent.parent / "logs"
@@ -47,6 +49,13 @@ CLIENT_ID = os.getenv("SHAREPOINT_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SHAREPOINT_CLIENT_SECRET")
 TARGET_FOLDER = os.getenv("SHAREPOINT_TARGET_FOLDER")
 
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}" if TENANT_ID else ""
+SCOPES = ["https://graph.microsoft.com/.default"]
+
+# Cache to avoid repeating site/drive lookups
+_SITE_ID: Optional[str] = None
+_DRIVE_ID: Optional[str] = None
+
 # Local Reports Directories
 UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
 NDC_REPORTS_DIR = UPLOADS_DIR / "NDC_Reports"
@@ -60,53 +69,188 @@ def ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def connect_sharepoint():
-    """Authenticate and connect to SharePoint using client credentials."""
-    if not all([SITE_URL, CLIENT_ID, CLIENT_SECRET]):
-        raise ValueError(
-            "Missing SharePoint configuration in environment variables. "
-            "Please ensure SHAREPOINT_SITE_URL, SHAREPOINT_CLIENT_ID, and "
-            "SHAREPOINT_CLIENT_SECRET are set in your .env file."
+async def get_access_token() -> str:
+    """Obtain a Microsoft Graph API access token using client credentials flow."""
+    app = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=AUTHORITY,
+        client_credential=CLIENT_SECRET
+    )
+    
+    # Try getting token silently from cache
+    result = app.acquire_token_silent(SCOPES, account=None)
+    if not result:
+        result = await asyncio.to_thread(
+            app.acquire_token_for_client,
+            scopes=SCOPES
         )
-
-    ctx_auth = AuthenticationContext(SITE_URL)
-    
-    if ctx_auth.acquire_token_for_app(CLIENT_ID, CLIENT_SECRET):
-        ctx = ClientContext(SITE_URL, ctx_auth)
-        return ctx
-    else:
-        error = ctx_auth.get_last_error()
-        raise RuntimeError(f"Acquire app-only access token failed: {error}")
-
-
-def ensure_folder_exists(ctx: ClientContext, folder_relative_url: str):
-    """Ensure a SharePoint folder path exists, creating subfolders one-by-one if needed."""
-    url = "/" + folder_relative_url.strip("/")
-    parts = [p for p in url.split("/") if p]
-    
-    current_path = ""
-    for idx, part in enumerate(parts):
-        if idx == 0:
-            current_path = "/" + part
-            continue
-        current_path = f"{current_path}/{part}"
         
-        # Skip checking the site prefix (e.g. /sites/AGEL-Automation/Shared Documents)
-        if idx < 3:
-            continue
+    if "access_token" in result:
+        return result["access_token"]
+    else:
+        error_msg = result.get("error_description") or result.get("error") or "Unknown error"
+        raise Exception(f"SharePoint authentication failed: {error_msg}")
+
+
+async def get_site_id(client: httpx.AsyncClient) -> str:
+    """Resolve the SharePoint Site ID from the SITE_URL."""
+    global _SITE_ID
+    if _SITE_ID:
+        return _SITE_ID
+
+    parsed_url = urllib.parse.urlparse(SITE_URL)
+    hostname = parsed_url.netloc
+    relative_path = parsed_url.path.rstrip("/")
+    
+    token = await get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    url = f"https://graph.microsoft.com/v1.0/sites/{hostname}:{relative_path}"
+    response = await client.get(url, headers=headers)
+    if response.status_code != 200:
+        raise Exception(f"Failed to resolve site ID: {response.status_code} - {response.text}")
+        
+    site_data = response.json()
+    _SITE_ID = site_data.get("id")
+    if not _SITE_ID:
+        raise Exception("Site details resolved but 'id' field is missing.")
+    return _SITE_ID
+
+
+async def get_drive_details(client: httpx.AsyncClient, site_id: str) -> Tuple[str, str]:
+    """Resolves the Drive ID and the base folder path inside that drive."""
+    global _DRIVE_ID
+
+    # Get site path (e.g. /sites/AGEL-Automation)
+    parsed_site = urllib.parse.urlparse(SITE_URL)
+    site_path = parsed_site.path.rstrip("/")
+    
+    # Get normalized target folder relative to site path
+    folder = TARGET_FOLDER
+    if folder.startswith(site_path):
+        folder = folder[len(site_path):]
+    folder = folder.strip("/")
+    
+    token = await get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    # Fetch all drives in the site
+    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives"
+    response = await client.get(url, headers=headers)
+    if response.status_code != 200:
+        raise Exception(f"Failed to list drives: {response.status_code}")
+        
+    drives = response.json().get("value", [])
+    
+    drive_id = None
+    folder_path_in_drive = ""
+    
+    # Match target folder against each drive
+    for d in drives:
+        # Get the relative path of the drive under the site
+        drive_web_url = d.get("webUrl", "")
+        parsed_drive = urllib.parse.urlparse(drive_web_url)
+        drive_path = parsed_drive.path.rstrip("/")
+        
+        # Relative path of the drive from the site root (e.g. "Shared Documents")
+        drive_rel_path = ""
+        if drive_path.startswith(site_path):
+            drive_rel_path = drive_path[len(site_path):].strip("/")
             
-        try:
-            folder = ctx.web.get_folder_by_server_relative_url(current_path)
-            ctx.load(folder)
-            ctx.execute_query()
-        except Exception:
-            parent_path = current_path.rsplit("/", 1)[0]
-            try:
-                parent_folder = ctx.web.get_folder_by_server_relative_url(parent_path)
-                parent_folder.folders.add(part)
-                ctx.execute_query()
-            except Exception as ex:
-                raise RuntimeError(f"Failed to create folder '{part}' in '{parent_path}': {ex}")
+        drive_name = d.get("name", "")
+        
+        # Candidates for the drive matching
+        candidates = []
+        if drive_rel_path:
+            candidates.append(drive_rel_path)
+            candidates.append(urllib.parse.unquote(drive_rel_path))
+            candidates.append(urllib.parse.quote(drive_rel_path))
+        if drive_name:
+            candidates.append(drive_name)
+            
+        # Check if the folder path starts with any of the candidates
+        for candidate in candidates:
+            candidate_clean = candidate.strip("/")
+            if not candidate_clean:
+                continue
+                
+            # Exact match or prefix match followed by /
+            if folder == candidate_clean:
+                drive_id = d.get("id")
+                folder_path_in_drive = ""
+                break
+            elif folder.startswith(candidate_clean + "/"):
+                drive_id = d.get("id")
+                folder_path_in_drive = folder[len(candidate_clean):].strip("/")
+                break
+                
+        if drive_id:
+            break
+
+    # If no matching drive was found, fallback to the site's default drive
+    if not drive_id:
+        default_drive_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive"
+        res = await client.get(default_drive_url, headers=headers)
+        if res.status_code == 200:
+            drive_id = res.json().get("id")
+            folder_path_in_drive = folder
+        else:
+            raise Exception(f"Failed to resolve site default drive: {res.text}")
+            
+    _DRIVE_ID = drive_id
+    return drive_id, folder_path_in_drive
+
+
+def encode_path_segments(path: str) -> str:
+    """Safely URL-encodes each path segment individually, preserving slashes."""
+    segments = [urllib.parse.quote(s) for s in path.split("/") if s]
+    return "/".join(segments)
+
+
+async def upload_file(client: httpx.AsyncClient, site_id: str, drive_id: str, target_folder_url: str, local_file_path: Path):
+    """Upload a file to a specific folder on SharePoint via Graph API."""
+    file_name = local_file_path.name
+    file_size = local_file_path.stat().st_size
+    
+    # Determine the target path for the file
+    clean_folder = "/".join([p for p in target_folder_url.split("/") if p])
+    target_file_path = f"{clean_folder}/{file_name}"
+    encoded_path = encode_path_segments(target_file_path)
+    
+    token = await get_access_token()
+    
+    # Read the file content
+    with open(local_file_path, "rb") as f:
+        file_data = f.read()
+
+    if file_size <= 4 * 1024 * 1024:  # 4MB
+        url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:/{encoded_path}:/content"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/octet-stream"
+        }
+        response = await client.put(url, headers=headers, content=file_data)
+        if response.status_code not in [200, 201]:
+            raise Exception(f"Upload failed (PUT): {response.status_code} - {response.text}")
+    else:
+        # Create upload session for larger files
+        session_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:/{encoded_path}:/createUploadSession"
+        session_response = await client.post(session_url, headers={"Authorization": f"Bearer {token}"})
+        if session_response.status_code != 200:
+            raise Exception(f"Failed to create upload session: {session_response.status_code} - {session_response.text}")
+        
+        upload_url = session_response.json().get("uploadUrl")
+        chunk_size = 3276800  # Must be multiple of 327,680 bytes
+        for i in range(0, file_size, chunk_size):
+            chunk = file_data[i:i+chunk_size]
+            content_range = f"bytes {i}-{i+len(chunk)-1}/{file_size}"
+            chunk_headers = {
+                "Content-Length": str(len(chunk)),
+                "Content-Range": content_range
+            }
+            chunk_res = await client.put(upload_url, headers=chunk_headers, content=chunk)
+            if chunk_res.status_code not in [200, 201, 202]:
+                raise Exception(f"Chunk upload failed (Session): {chunk_res.status_code} - {chunk_res.text}")
 
 
 def get_latest_report(directory: Path, pattern: str = "*.xls") -> Path:
@@ -124,19 +268,6 @@ def get_latest_report(directory: Path, pattern: str = "*.xls") -> Path:
     return files[0]
 
 
-def upload_file_to_sharepoint(ctx: ClientContext, local_file_path: Path, target_folder_url: str):
-    """Upload a local file to a target SharePoint folder."""
-    file_name = local_file_path.name
-
-    ensure_folder_exists(ctx, target_folder_url)
-
-    target_folder = ctx.web.get_folder_by_server_relative_url(target_folder_url)
-    target_folder.files.upload(str(local_file_path))
-    ctx.execute_query()
-    
-    print(f"[{ts()}] Uploaded: {file_name}")
-
-
 def cleanup_old_ndc_reports(latest_file: Path):
     """Delete all files in uploads/NDC_Reports except for the latest_file."""
     try:
@@ -152,7 +283,7 @@ def cleanup_old_ndc_reports(latest_file: Path):
         print(f"[{ts()}] [CLEANUP] Local cleanup error: {traceback.format_exc()}")
 
 
-def upload_ndc_reports(ctx: ClientContext, target_base: str):
+async def upload_ndc_reports(client: httpx.AsyncClient, site_id: str, drive_id: str, target_base: str):
     """Upload only the latest Excel file from local uploads/NDC_Reports to SharePoint."""
     if not NDC_REPORTS_DIR.exists():
         return
@@ -167,32 +298,45 @@ def upload_ndc_reports(ctx: ClientContext, target_base: str):
 
     target_folder_url = f"{target_base}/NDC_Reports"
     
-    ensure_folder_exists(ctx, target_folder_url)
+    # Try to clean up existing files on SharePoint
     try:
-        target_folder = ctx.web.get_folder_by_server_relative_url(target_folder_url)
-        files = target_folder.files
-        ctx.load(files)
-        ctx.execute_query()
+        token = await get_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        encoded_path = encode_path_segments(target_folder_url)
         
-        deleted_count = 0
-        for f in files:
-            try:
-                f.delete_object()
-                deleted_count += 1
-            except Exception as e:
-                print(f"[{ts()}] [CLEANUP] Could not delete SharePoint file: {e}")
+        url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:/{encoded_path}:/children"
+        response = await client.get(url, headers=headers)
         
-        if deleted_count > 0:
-            ctx.execute_query()
-            print(f"[{ts()}] [CLEANUP] Deleted {deleted_count} old files from SharePoint.")
+        if response.status_code == 200:
+            children = response.json().get("value", [])
+            files = [item for item in children if "file" in item]
+            deleted_count = 0
+            for f in files:
+                item_id = f.get("id")
+                delete_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{item_id}"
+                del_res = await client.delete(delete_url, headers=headers)
+                if del_res.status_code in [200, 204]:
+                    deleted_count += 1
+                else:
+                    print(f"[{ts()}] [CLEANUP] Could not delete SharePoint file {f.get('name')}: {del_res.text}")
+            if deleted_count > 0:
+                print(f"[{ts()}] [CLEANUP] Deleted {deleted_count} old files from SharePoint.")
+        elif response.status_code == 404:
+            print(f"[{ts()}] [CLEANUP] Target folder '{target_folder_url}' does not exist yet. It will be created during upload.")
+        else:
+            print(f"[{ts()}] [CLEANUP] SharePoint cleanup error: {response.status_code} - {response.text}")
     except Exception as e:
         print(f"[{ts()}] [CLEANUP] SharePoint cleanup error: {traceback.format_exc()}")
 
     print(f"[{ts()}] NDC report: {latest_file.name}")
-    upload_file_to_sharepoint(ctx, latest_file, target_folder_url)
+    try:
+        await upload_file(client, site_id, drive_id, target_folder_url, latest_file)
+        print(f"[{ts()}] Uploaded successfully: {latest_file.name}")
+    except Exception as e:
+        print(f"[{ts()}] [ERROR] Upload failed: {e}\n{traceback.format_exc()}")
 
 
-def upload_ff_reports(ctx: ClientContext, target_base: str):
+async def upload_ff_reports(client: httpx.AsyncClient, site_id: str, drive_id: str, target_base: str):
     """Upload all F&F documents from local uploads/FF_Reports to SharePoint."""
     if not FF_REPORTS_DIR.exists():
         return
@@ -214,12 +358,13 @@ def upload_ff_reports(ctx: ClientContext, target_base: str):
         emp_target_url = f"{target_base_url}/{emp_id}"
         for f in files:
             try:
-                upload_file_to_sharepoint(ctx, f, emp_target_url)
+                await upload_file(client, site_id, drive_id, emp_target_url, f)
+                print(f"[{ts()}] Uploaded successfully: {f.name} for employee {emp_id}")
             except Exception as e:
                 print(f"[{ts()}] [ERROR] Failed to upload {f.name} for employee {emp_id}: {e}\n{traceback.format_exc()}")
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="Upload report files to SharePoint.")
     parser.add_argument(
         "--type",
@@ -235,31 +380,28 @@ def main():
     args = parser.parse_args()
 
     try:
-        # Connect to SharePoint
-        ctx = connect_sharepoint()
+        async with httpx.AsyncClient() as client:
+            print(f"[{ts()}] Connecting to SharePoint...")
+            site_id = await get_site_id(client)
+            drive_id, folder_path = await get_drive_details(client, site_id)
+            print(f"[{ts()}] Connected successfully.")
+            print(f"[{ts()}] Target folder: {TARGET_FOLDER}")
 
-        if args.file:
-            # Upload a single specific file to the base target folder
-            local_file = Path(args.file)
-            if not local_file.exists():
-                raise FileNotFoundError(f"Specified file not found: {args.file}")
-            upload_file_to_sharepoint(ctx, local_file, TARGET_FOLDER)
-        else:
-            # Standard directory based upload
-            if not TARGET_FOLDER:
-                raise ValueError("SHAREPOINT_TARGET_FOLDER environment variable is not set.")
+            if args.file:
+                local_file = Path(args.file)
+                if not local_file.exists():
+                    raise FileNotFoundError(f"Specified file not found: {args.file}")
+                print(f"[{ts()}] Uploading single file: {local_file.name} to {folder_path}")
+                await upload_file(client, site_id, drive_id, folder_path, local_file)
+                print(f"[{ts()}] Upload Completed successfully.")
+            else:
+                if args.type in ["ndc", "all"]:
+                    print(f"[{ts()}] Starting NDC reports upload...")
+                    await upload_ndc_reports(client, site_id, drive_id, folder_path)
 
-            if args.type in ["ndc", "all"]:
-                try:
-                    upload_ndc_reports(ctx, TARGET_FOLDER)
-                except Exception as e:
-                    print(f"[{ts()}] [ERROR] NDC reports upload failed: {e}\n{traceback.format_exc()}")
-
-            if args.type in ["ff", "all"]:
-                try:
-                    upload_ff_reports(ctx, TARGET_FOLDER)
-                except Exception as e:
-                    print(f"[{ts()}] [ERROR] F&F reports upload failed: {e}\n{traceback.format_exc()}")
+                if args.type in ["ff", "all"]:
+                    print(f"[{ts()}] Starting F&F reports upload...")
+                    await upload_ff_reports(client, site_id, drive_id, folder_path)
 
     except ValueError as e:
         print(f"\n[{ts()}] [ERROR] Configuration Error: {traceback.format_exc()}")
@@ -267,11 +409,9 @@ def main():
         print(f"\n[{ts()}] [ERROR] File Not Found: {traceback.format_exc()}")
     except PermissionError as e:
         print(f"\n[{ts()}] [ERROR] Local Permission Error: {traceback.format_exc()}")
-    except ClientRequestException as e:
-        print(f"\n[{ts()}] [ERROR] SharePoint API Error: {e.response.status_code}\n{traceback.format_exc()}")
     except Exception as e:
         print(f"\n[{ts()}] [ERROR] Unexpected Error: {traceback.format_exc()}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
