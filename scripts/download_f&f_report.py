@@ -66,6 +66,9 @@ ELEMENT_TIMEOUT = 15_000
 # Page load / navigation timeout (ms)
 NAV_TIMEOUT = 60_000
 
+# Maximum number of concurrent browser tabs for parallel downloads
+MAX_CONCURRENT_TABS = 5
+
 # How long to wait for the search results page to fully render (ms)
 SEARCH_RESULTS_WAIT = 10_000
 
@@ -544,13 +547,37 @@ async def get_document_count(page) -> int:
         return 0
 
 
+# ── F&F Document Name Filter ─────────────────────────────────────────────────
+# Strong regex to match ONLY F&F (Full & Final) sheet documents.
+# Matches:  "F AND F", "F&F", "FNF", "F_AND_F", "FULL AND FINAL", "FULL_AND_FINAL"
+# Case-insensitive. Rejects experience letters, relieving letters, resignation
+# letters, NDC forms, undertakings, and any other non-F&F documents.
+FF_DOCUMENT_PATTERN = re.compile(
+    r"(?i)"
+    r"("
+    r"F\s*AND\s*F"
+    r"|F\s*&\s*F"
+    r"|F[_\-\s]*N[_\-\s]*F"
+    r"|F_AND_F"
+    r"|FULL\s*AND\s*FINAL"
+    r"|FULL[_\-]AND[_\-]FINAL"
+    r")"
+)
+
+
+def _is_ff_document(name: str) -> bool:
+    """Return True only if the document name matches the F&F pattern."""
+    return bool(FF_DOCUMENT_PATTERN.search(name))
+
+
 async def download_document_at_row(
     page, row_index: int, total_rows: int, download_dir: Path
 ) -> Optional[str]:
     """
     Download a single document from the folder table by its 1-based row index.
-    Flow: hover row → check if folder → click "More actions" → click "Download".
+    Flow: hover row → check if folder → check F&F name → click "More actions" → click "Download".
 
+    Only downloads documents whose name matches the F&F regex pattern.
     The row_index is 1-based matching the <tr> nth-of-type in the DOM.
     """
     row_selector = f"tbody tr:nth-of-type({row_index})"
@@ -575,10 +602,15 @@ async def download_document_at_row(
                 is_folder = True
 
         if is_folder:
-            print(f"[{ts()}] Skipping folder row: '{row_name}' (row {row_index}/{total_rows})")
+            print(f"[{ts()}] Skipping folder: '{row_name}' (row {row_index}/{total_rows})")
             return None
 
-        print(f"[{ts()}] Downloading document: '{row_name}' (row {row_index}/{total_rows})...")
+        # ── F&F Filter: Only download F&F sheet documents ─────────────────
+        if not _is_ff_document(row_name):
+            print(f"[{ts()}] Skipping non-F&F document: '{row_name}' (row {row_index}/{total_rows})")
+            return None
+
+        print(f"[{ts()}] Downloading F&F document: '{row_name}' (row {row_index}/{total_rows})...")
         await row.hover()
         await page.wait_for_timeout(1000)
     except Exception as e:
@@ -613,19 +645,70 @@ async def download_document_at_row(
 
     await page.wait_for_timeout(1500)
 
-    # Click "Download" from the dropdown menu
+    # ── Click "Download" from the dropdown menu ──────────────────────────
+    # The dropdown items can be hidden until the menu is fully expanded.
+    # Strategy: try visible click first, then force-click on hidden elements.
     try:
         async with page.expect_download(timeout=60_000) as dl_info:
-            await click_with_fallback(
-                page,
-                [
+            download_clicked = False
+
+            # Attempt 1: Try standard visible selectors
+            download_selectors = [
+                'a[title="Download"]',
+                'ul.binf-dropdown-menu a[title="Download"]',
+                'li.binf-dropdown ul.binf-dropdown-menu a[title="Download"]',
+                f"li.binf-dropdown li:nth-of-type(1) > a",
+                'xpath=//ul[contains(@class,"binf-dropdown-menu")]//a[@title="Download"]',
+            ]
+            for sel in download_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.is_visible(timeout=3000):
+                        await loc.scroll_into_view_if_needed()
+                        await loc.click()
+                        download_clicked = True
+                        break
+                except Exception:
+                    continue
+
+            # Attempt 2: Force-click on hidden Download link (common in this UI)
+            if not download_clicked:
+                force_selectors = [
                     'a[title="Download"]',
-                    f"li.binf-dropdown li:nth-of-type(1) > a",
+                    'xpath=//a[@title="Download"]',
                     'xpath=//a[contains(.,"Download")]',
-                ],
-                f"Download (row {row_index})",
-                timeout_each=8000,
-            )
+                ]
+                for sel in force_selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        # Check element exists in DOM even if hidden
+                        if await loc.count() > 0:
+                            await loc.click(force=True, timeout=8000)
+                            download_clicked = True
+                            print(f"[{ts()}]   Used force-click on Download button")
+                            break
+                    except Exception:
+                        continue
+
+            if not download_clicked:
+                # Attempt 3: Use keyboard shortcut or dispatch click event via JS
+                try:
+                    await page.evaluate("""
+                        () => {
+                            const link = document.querySelector('a[title="Download"]');
+                            if (link) { link.click(); return true; }
+                            return false;
+                        }
+                    """)
+                    download_clicked = True
+                    print(f"[{ts()}]   Used JavaScript click on Download button")
+                except Exception:
+                    pass
+
+            if not download_clicked:
+                raise RuntimeError(
+                    f"Could not click Download for row {row_index} after all attempts"
+                )
 
         download = await dl_info.value
         failure = await download.failure()
@@ -802,6 +885,7 @@ def prompt_employee_numbers() -> List[str]:
 async def download_ff_reports(employee_numbers: List[str]):
     """
     Main entry point. Downloads F&F exit documents for one or more employees.
+    Uses concurrent browser tabs (up to MAX_CONCURRENT_TABS) for parallel processing.
 
     Args:
         employee_numbers: List of employee numbers to process.
@@ -812,11 +896,13 @@ async def download_ff_reports(employee_numbers: List[str]):
         print(f"[{ts()}] No employee numbers provided. Exiting.")
         return
 
+    concurrency = min(MAX_CONCURRENT_TABS, len(employee_numbers))
     print(f"[{ts()}] Starting F&F report download ({'headless' if HEADLESS == 'true' else 'visible'})")
+    print(f"[{ts()}] Concurrency: {concurrency} tab(s) for {len(employee_numbers)} employee(s)")
 
     _cleanup_profile_locks()
 
-    all_results = {}
+    all_results: dict[str, List[str]] = {}
 
     try:
         async with async_playwright() as p:
@@ -836,38 +922,80 @@ async def download_ff_reports(employee_numbers: List[str]):
                 ],
             )
 
-            page = context.pages[0] if context.pages else await context.new_page()
+            # ── Step 1: Use the first tab to establish login / SSO ────────
+            first_page = context.pages[0] if context.pages else await context.new_page()
 
             print(f"[{ts()}] Navigating to Content Server...")
-            await page.goto(
+            await first_page.goto(
                 CONTENT_SERVER_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT
             )
-            await page.wait_for_timeout(3000)
+            await first_page.wait_for_timeout(3000)
 
-            # Wait for the page to load (Windows auth should be automatic)
-            await wait_for_content_server_home(page, timeout_s=120)
-            await page.wait_for_timeout(2000)
+            # Wait for the page to load (handles SSO login if needed)
+            await wait_for_content_server_home(first_page, timeout_s=120)
+            await first_page.wait_for_timeout(2000)
+            print(f"[{ts()}] Login confirmed. Preparing {concurrency} tab(s)...\n")
 
-            # Process each employee
-            for idx, emp_num in enumerate(employee_numbers, 1):
-                print()
-                print(f"[{ts()}] ── Employee {idx}/{len(employee_numbers)}: {emp_num} ──")
-                downloaded = await download_ff_for_employee(page, emp_num, DOWNLOAD_DIR)
-                all_results[emp_num] = downloaded
+            # ── Step 2: Pre-create all tabs sequentially ──────────────────
+            # Chrome cannot handle multiple simultaneous Target.createTarget
+            # calls, so we open tabs one-at-a-time before running work.
+            worker_pages = [first_page]  # Reuse first page for worker 1
+            for i in range(1, concurrency):
+                try:
+                    new_tab = await context.new_page()
+                    worker_pages.append(new_tab)
+                    print(f"[{ts()}]   Opened tab {i + 1}/{concurrency}")
+                    await asyncio.sleep(0.5)  # Small delay between tab creation
+                except Exception as e:
+                    print(f"[{ts()}]   Could not open tab {i + 1}: {e}")
+                    break
 
-                if idx < len(employee_numbers):
-                    # Go back home to prepare for the next employee
-                    try:
-                        await navigate_home(page)
-                    except Exception:
-                        try:
-                            await page.goto(CONTENT_SERVER_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-                        except Exception:
-                            pass
-                    # Wait before processing next employee
-                    await page.wait_for_timeout(2000)
-                    # Ensure we're on the home page
-                    await wait_for_content_server_home(page, timeout_s=30)
+            actual_concurrency = len(worker_pages)
+            print(f"[{ts()}] {actual_concurrency} tab(s) ready. Starting downloads...\n")
+
+            # ── Step 3: Worker coroutine for one employee ─────────────────
+            async def _worker(worker_page, emp_num: str, idx: int):
+                """Process a single employee in its own (pre-created) browser tab."""
+                try:
+                    print(f"[{ts()}] ── [Tab] Employee {idx}/{len(employee_numbers)}: {emp_num} ──")
+
+                    # Navigate this tab to Content Server home
+                    await worker_page.goto(
+                        CONTENT_SERVER_URL,
+                        wait_until="domcontentloaded",
+                        timeout=NAV_TIMEOUT,
+                    )
+                    await worker_page.wait_for_timeout(2000)
+                    await wait_for_content_server_home(worker_page, timeout_s=30)
+
+                    # Download F&F docs for this employee
+                    downloaded = await download_ff_for_employee(
+                        worker_page, emp_num, DOWNLOAD_DIR
+                    )
+                    all_results[emp_num] = downloaded
+                except Exception as e:
+                    print(f"[{ts()}] [Tab] Error for {emp_num}: {e}")
+                    all_results[emp_num] = []
+
+            # ── Step 4: Process employees in batches ──────────────────────
+            # Split employee list into batches matching available tabs.
+            # Each batch runs concurrently; batches run sequentially.
+            for batch_start in range(0, len(employee_numbers), actual_concurrency):
+                batch = employee_numbers[batch_start : batch_start + actual_concurrency]
+                batch_tasks = []
+                for i, emp_num in enumerate(batch):
+                    page = worker_pages[i]
+                    idx = batch_start + i + 1
+                    batch_tasks.append(_worker(page, emp_num, idx))
+
+                await asyncio.gather(*batch_tasks)
+
+            # Close all tabs
+            for wp in worker_pages:
+                try:
+                    await wp.close()
+                except Exception:
+                    pass
 
             await context.close()
 
