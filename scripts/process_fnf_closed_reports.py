@@ -29,7 +29,7 @@ from scripts.upload_to_sharepoint import (
     get_drive_details,
     encode_path_segments,
     TARGET_FOLDER,
-    upload_ff_reports,
+    upload_file,
     FF_REPORTS_DIR
 )
 
@@ -167,32 +167,37 @@ async def process_fnf_active_reports():
                         print(f"[{ts()}] No valid employee IDs found in {file_name}.")
                         continue
                         
-                    # 3. Call the F&F download script
-                    print(f"[{ts()}] Initiating F&F document download for {len(unique_employees)} employee(s)...")
-                    await download_ff_reports(unique_employees)
+                    # 3. Define the upload callback for parallel upload
+                    target_base_url = f"{folder_path}/F&F_Documents"
                     
-                    # 4. Push downloaded F&F documents to SharePoint
-                    print(f"[{ts()}] Uploading downloaded F&F documents to SharePoint...")
-                    await upload_ff_reports(client, site_id, drive_id, folder_path)
+                    async def on_employee_downloaded(emp_id: str, downloaded_paths: list):
+                        emp_target_url = f"{target_base_url}/{emp_id}"
+                        for file_path_str in downloaded_paths:
+                            f_path = Path(file_path_str)
+                            if f_path.exists():
+                                try:
+                                    await upload_file(client, site_id, drive_id, emp_target_url, f_path)
+                                    print(f"[{ts()}] Uploaded successfully: {f_path.name} for employee {emp_id}")
+                                    f_path.unlink()  # delete after successful upload
+                                except Exception as e:
+                                    print(f"[{ts()}] [ERROR] Failed to upload {f_path.name} for {emp_id}: {e}")
+                                    
+                        # Try to remove the employee folder if empty
+                        emp_dir = FF_REPORTS_DIR / emp_id
+                        if emp_dir.exists() and emp_dir.is_dir():
+                            try:
+                                emp_dir.rmdir()
+                            except:
+                                pass
+
+                    # 4. Call the F&F download script with the callback
+                    print(f"[{ts()}] Initiating F&F document download for {len(unique_employees)} employee(s)...")
+                    await download_ff_reports(unique_employees, upload_callback=on_employee_downloaded)
                     
                     # 5. Clean up local Excel file
                     if local_file_path.exists():
                         local_file_path.unlink()
                         print(f"[{ts()}] [CLEANUP] Deleted local Excel file: {file_name}")
-                        
-                    # Optional: Clean up local F&F documents after successful upload
-                    for subdir in FF_REPORTS_DIR.iterdir():
-                        if subdir.is_dir():
-                            for f in subdir.iterdir():
-                                if f.is_file():
-                                    try:
-                                        f.unlink()
-                                    except Exception as e:
-                                        print(f"[{ts()}] [CLEANUP] Failed to delete {f.name}: {e}")
-                            try:
-                                subdir.rmdir()
-                            except Exception as e:
-                                print(f"[{ts()}] [CLEANUP] Failed to delete directory {subdir.name}: {e}")
                                 
 
                 except Exception as e:

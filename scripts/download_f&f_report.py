@@ -623,6 +623,9 @@ async def download_document_at_row(
             print(f"[{ts()}] Skipping non-F&F document: '{row_name}' (row {row_index}/{total_rows})")
             return None
 
+        # Create the local folder only now that we know we have a valid F&F document
+        download_dir.mkdir(parents=True, exist_ok=True)
+
         print(f"[{ts()}] Downloading F&F document: '{row_name}' (row {row_index}/{total_rows})...")
         await row.hover()
         await page.wait_for_timeout(1000)
@@ -798,11 +801,8 @@ async def download_ff_for_employee(
       5. Navigate back home
     Returns a list of downloaded file paths.
     """
-    # Create a subfolder for this employee
-    emp_dir = download_dir / employee_number
-    emp_dir.mkdir(parents=True, exist_ok=True)
-
     downloaded_files = []
+    emp_dir = None
 
     try:
         # Step 1: Search
@@ -820,6 +820,10 @@ async def download_ff_for_employee(
         if doc_count == 0:
             print(f"[{ts()}]   No documents found for employee {employee_number}")
         else:
+            # Define the subfolder path, but do NOT create it yet.
+            # It will be created in download_document_at_row ONLY if a valid document is found.
+            emp_dir = download_dir / employee_number
+            
             for row_idx in range(1, doc_count + 1):
                 result = await download_document_at_row(
                     page, row_idx, doc_count, emp_dir
@@ -895,7 +899,7 @@ def prompt_employee_numbers() -> List[str]:
     return unique
 
 
-async def download_ff_reports(employee_numbers: List[str]):
+async def download_ff_reports(employee_numbers: List[str], upload_callback=None):
     """
     Main entry point. Downloads F&F exit documents for one or more employees.
     Uses concurrent browser tabs (up to MAX_CONCURRENT_TABS) for parallel processing.
@@ -991,6 +995,14 @@ async def download_ff_reports(employee_numbers: List[str]):
                         worker_page, emp_num, DOWNLOAD_DIR
                     )
                     all_results[emp_num] = downloaded
+                    
+                    if downloaded and upload_callback:
+                        try:
+                            print(f"[{ts()}] [Tab] Triggering upload for {emp_num}...")
+                            await upload_callback(emp_num, downloaded)
+                        except Exception as e:
+                            print(f"[{ts()}] [Tab] Upload callback failed for {emp_num}: {e}")
+                            
                 except Exception as e:
                     print(f"[{ts()}] [Tab] Error for {emp_num}: {e}")
                     all_results[emp_num] = []
