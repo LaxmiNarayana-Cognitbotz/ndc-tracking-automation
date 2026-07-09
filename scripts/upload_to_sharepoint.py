@@ -12,9 +12,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
-from dotenv import load_dotenv
 import httpx
 import msal
+from dotenv import load_dotenv
 
 # Redirect stdout and stderr to a log file
 LOG_DIR = Path(__file__).parent.parent / "logs"
@@ -27,15 +27,28 @@ class LoggerWriter:
         self.file_path = file_path
 
     def write(self, message):
-        self.terminal.write(message)
         try:
             with open(self.file_path, "a", encoding="utf-8") as f:
                 f.write(message)
         except Exception:
             pass
+        if self.terminal is not None:
+            try:
+                self.terminal.write(message)
+            except UnicodeEncodeError:
+                try:
+                    self.terminal.write(message.encode("cp1252", errors="replace").decode("cp1252"))
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
     def flush(self):
-        self.terminal.flush()
+        if self.terminal is not None:
+            try:
+                self.terminal.flush()
+            except Exception:
+                pass
 
 sys.stdout = LoggerWriter(LOG_FILE)
 sys.stderr = LoggerWriter(LOG_FILE)
@@ -71,10 +84,18 @@ def ts():
 
 async def get_access_token() -> str:
     """Obtain a Microsoft Graph API access token using client credentials flow."""
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    session = requests.Session()
+    session.verify = False
+
     app = msal.ConfidentialClientApplication(
         CLIENT_ID,
         authority=AUTHORITY,
-        client_credential=CLIENT_SECRET
+        client_credential=CLIENT_SECRET,
+        http_client=session
     )
     
     # Try getting token silently from cache
@@ -380,7 +401,7 @@ async def main():
     args = parser.parse_args()
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(verify=False) as client:
             print(f"[{ts()}] Connecting to SharePoint...")
             site_id = await get_site_id(client)
             drive_id, folder_path = await get_drive_details(client, site_id)

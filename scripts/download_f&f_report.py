@@ -26,15 +26,28 @@ class LoggerWriter:
         self.file_path = file_path
 
     def write(self, message):
-        self.terminal.write(message)
         try:
             with open(self.file_path, "a", encoding="utf-8") as f:
                 f.write(message)
         except Exception:
             pass
+        if self.terminal is not None:
+            try:
+                self.terminal.write(message)
+            except UnicodeEncodeError:
+                try:
+                    self.terminal.write(message.encode("cp1252", errors="replace").decode("cp1252"))
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
     def flush(self):
-        self.terminal.flush()
+        if self.terminal is not None:
+            try:
+                self.terminal.flush()
+            except Exception:
+                pass
 
 
 sys.stdout = LoggerWriter(LOG_FILE)
@@ -894,6 +907,11 @@ async def download_ff_reports(employee_numbers: List[str]):
 
     if not employee_numbers:
         print(f"[{ts()}] No employee numbers provided. Exiting.")
+        return
+        
+    if not CONTENT_SERVER_URL:
+        print(f"[{ts()}] [FATAL ERROR] CONTENT_SERVER_URL is completely blank in your .env file!")
+        print(f"[{ts()}] Please open the .env file and add the URL like: CONTENT_SERVER_URL=https://...")
         return
 
     concurrency = min(MAX_CONCURRENT_TABS, len(employee_numbers))

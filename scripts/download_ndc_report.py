@@ -9,9 +9,10 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 import pandas as pd
+from dotenv import load_dotenv
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 # Redirect stdout and stderr to a log file
 LOG_DIR = Path(__file__).parent.parent / "logs"
@@ -24,15 +25,28 @@ class LoggerWriter:
         self.file_path = file_path
 
     def write(self, message):
-        self.terminal.write(message)
         try:
             with open(self.file_path, "a", encoding="utf-8") as f:
                 f.write(message)
         except Exception:
             pass
+        if self.terminal is not None:
+            try:
+                self.terminal.write(message)
+            except UnicodeEncodeError:
+                try:
+                    self.terminal.write(message.encode("cp1252", errors="replace").decode("cp1252"))
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
     def flush(self):
-        self.terminal.flush()
+        if self.terminal is not None:
+            try:
+                self.terminal.flush()
+            except Exception:
+                pass
 
 sys.stdout = LoggerWriter(LOG_FILE)
 sys.stderr = LoggerWriter(LOG_FILE)

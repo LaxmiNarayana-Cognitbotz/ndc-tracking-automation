@@ -133,14 +133,17 @@ uv run scripts/upload_to_sharepoint.py --type ff
 
 ## Automated Scheduling
 
-The pipeline runs automatically at **10 AM, 1 PM, 4 PM, and 7 PM** every day.
-If the PC was off or asleep at trigger time, it runs immediately on the next boot/wake.
+The pipeline schedules run automatically every day:
+- **NDC Pipeline**: Runs at **10:00, 13:00, 16:00, and 19:00**
+- **F&F Pipeline**: Runs at **10:15, 13:15, 16:15, and 19:15**
+
+If the PC was off or asleep at trigger time, missed tasks run automatically on the next boot/wake.
 
 ---
 
 ### ▶ Setup — Run Once Per Machine
 
-Open **PowerShell or CMD as Administrator** and run:
+Open **PowerShell or CMD** and run:
 
 ```cmd
 cd "C:\Projects\NDC-Tracking-Automation"
@@ -154,21 +157,25 @@ powershell -ExecutionPolicy Bypass -File scheduler\setup_scheduler.ps1
 
 ### 🔍 Verify — Check Tasks Are Active
 
-Run after setup **or after every restart** to confirm all 4 tasks are alive:
+Run after setup **or after every restart** to confirm all 8 tasks are alive:
 
 **PowerShell:**
 ```powershell
-Get-ScheduledTask -TaskName "NDC_Pipeline_*" | Select-Object TaskName, State
+Get-ScheduledTask -TaskName "*_Pipeline_*" | Select-Object TaskName, State
 ```
 
 **CMD:**
 ```cmd
-schtasks /Query /FO TABLE | findstr "NDC_Pipeline"
+schtasks /Query /FO TABLE | findstr "Pipeline"
 ```
 
-✅ Expected output — all tasks must show `Ready`:
+✅ Expected output — all 8 tasks must show `Ready`:
 ```
 TaskName           State
+FNF_Pipeline_1015  Ready
+FNF_Pipeline_1315  Ready
+FNF_Pipeline_1615  Ready
+FNF_Pipeline_1915  Ready
 NDC_Pipeline_1000  Ready
 NDC_Pipeline_1300  Ready
 NDC_Pipeline_1600  Ready
@@ -179,23 +186,12 @@ NDC_Pipeline_1900  Ready
 
 ### ⏸ Stop / Disable — Pause Without Deleting
 
-Use this when you want to **temporarily stop** the pipeline (e.g. during maintenance).
+Use this when you want to **temporarily stop** a pipeline (e.g. during maintenance).
 Tasks remain registered — just won't fire until re-enabled.
 
 **PowerShell:**
 ```powershell
-Disable-ScheduledTask -TaskName "NDC_Pipeline_1000"
-Disable-ScheduledTask -TaskName "NDC_Pipeline_1300"
-Disable-ScheduledTask -TaskName "NDC_Pipeline_1600"
-Disable-ScheduledTask -TaskName "NDC_Pipeline_1900"
-```
-
-**CMD:**
-```cmd
-schtasks /Change /TN "NDC_Pipeline_1000" /DISABLE
-schtasks /Change /TN "NDC_Pipeline_1300" /DISABLE
-schtasks /Change /TN "NDC_Pipeline_1600" /DISABLE
-schtasks /Change /TN "NDC_Pipeline_1900" /DISABLE
+Get-ScheduledTask -TaskName "*_Pipeline_*" | Disable-ScheduledTask
 ```
 
 ---
@@ -204,33 +200,19 @@ schtasks /Change /TN "NDC_Pipeline_1900" /DISABLE
 
 **PowerShell:**
 ```powershell
-Enable-ScheduledTask -TaskName "NDC_Pipeline_1000"
-Enable-ScheduledTask -TaskName "NDC_Pipeline_1300"
-Enable-ScheduledTask -TaskName "NDC_Pipeline_1600"
-Enable-ScheduledTask -TaskName "NDC_Pipeline_1900"
-```
-
-**CMD:**
-```cmd
-schtasks /Change /TN "NDC_Pipeline_1000" /ENABLE
-schtasks /Change /TN "NDC_Pipeline_1300" /ENABLE
-schtasks /Change /TN "NDC_Pipeline_1600" /ENABLE
-schtasks /Change /TN "NDC_Pipeline_1900" /ENABLE
+Get-ScheduledTask -TaskName "*_Pipeline_*" | Enable-ScheduledTask
 ```
 
 ---
 
 ### 🗑 Remove — Permanently Delete Tasks
 
-Use this to **completely unregister** all tasks from Windows.
+Use this to **completely unregister** all NDC and F&F tasks from Windows.
 You will need to run `setup_scheduler.ps1` again to restore them.
 
 **PowerShell or CMD:**
 ```cmd
-schtasks /Delete /TN "NDC_Pipeline_1000" /F
-schtasks /Delete /TN "NDC_Pipeline_1300" /F
-schtasks /Delete /TN "NDC_Pipeline_1600" /F
-schtasks /Delete /TN "NDC_Pipeline_1900" /F
+powershell -ExecutionPolicy Bypass -File scheduler\setup_scheduler.ps1 -Uninstall
 ```
 
 ---
