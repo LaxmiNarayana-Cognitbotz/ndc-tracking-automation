@@ -153,19 +153,22 @@ async def _handle_microsoft_sso(page):
     await page.wait_for_timeout(2000)
     await check_for_sso_errors(page)
 
-    # ── Detect Current SSO State ──────────────────────────────────────────
+    # ── Wait for SSO page to stabilise before touching any input ─────────
     email_filled = False
     try:
-        # Wait for either the email field or password field to appear
-        any_input = page.locator('input[name="loginfmt"], input[type="email"], input[name="passwd"], input[type="password"]')
-        await any_input.first.wait_for(state="visible", timeout=5000)
-        
-        # Check which one actually appeared
-        if await page.locator('input[name="passwd"], input[type="password"]').first.is_visible():
-            print(f"[{ts()}]   Password screen detected directly — skipping email entry.")
-            email_filled = True
+        # Wait specifically for the EMAIL field to appear (not password which may be
+        # hidden in the DOM on the email screen and cause false positives)
+        email_loc = page.locator('input[name="loginfmt"], input[id="i0116"]')
+        await email_loc.first.wait_for(state="visible", timeout=8000)
     except Exception:
-        pass
+        # Email field didn't appear - check if we somehow landed on the password screen
+        try:
+            pw_loc = page.locator('input[name="passwd"], input[id="i0118"]')
+            if await pw_loc.first.is_visible(timeout=3000):
+                print(f"[{ts()}]   Password screen detected directly — skipping email entry.")
+                email_filled = True
+        except Exception:
+            pass
 
     # ── Step 1: Email ─────────────────────────────────────────────────────
     if not email_filled:
@@ -179,10 +182,11 @@ async def _handle_microsoft_sso(page):
                 email_input = page.locator(sel).first
                 if await email_input.is_visible(timeout=5000):
                     for attempt in range(1, 4):
+                        await email_input.click()
                         await email_input.fill("")
                         await page.wait_for_timeout(200)
-                        await email_input.fill(ORACLE_EMAIL)
-                        print(f"[{ts()}]   Entered email: {ORACLE_EMAIL} (Attempt {attempt}/3)")
+                        await email_input.type(ORACLE_EMAIL.strip(), delay=50)
+                        print(f"[{ts()}]   Entered email (Attempt {attempt}/3)")
                         await page.wait_for_timeout(500)
 
                         # Click Next
@@ -225,9 +229,10 @@ async def _handle_microsoft_sso(page):
             pw_input = page.locator(sel).first
             if await pw_input.is_visible(timeout=5000):
                 for attempt in range(1, 4):
+                    await pw_input.click()
                     await pw_input.fill("")
                     await page.wait_for_timeout(200)
-                    await pw_input.fill(ORACLE_PASSWORD)
+                    await pw_input.type(ORACLE_PASSWORD.strip(), delay=50)
                     print(f"[{ts()}]   Entered password (Attempt {attempt}/3)")
                     await page.wait_for_timeout(500)
 

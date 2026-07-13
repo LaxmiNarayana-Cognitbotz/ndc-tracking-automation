@@ -161,44 +161,62 @@ async def _handle_microsoft_sso(page):
     await page.wait_for_timeout(2000)
     await check_for_sso_errors(page)
 
-    # ── Step 1: Email ─────────────────────────────────────────────────────
-    email_selectors = [
-        'input[name="loginfmt"]',
-        'input[type="email"]',
-        'input[id="i0116"]',
-    ]
+    # ── Wait for SSO page to stabilise before touching any input ─────────
     email_filled = False
-    for sel in email_selectors:
+    try:
+        # Wait specifically for the EMAIL field to appear (not password which may be
+        # hidden in the DOM on the email screen and cause false positives)
+        email_loc = page.locator('input[name="loginfmt"], input[id="i0116"]')
+        await email_loc.first.wait_for(state="visible", timeout=8000)
+    except Exception:
+        # Email field didn't appear - check if we somehow landed on the password screen
         try:
-            email_input = page.locator(sel).first
-            if await email_input.is_visible(timeout=5000):
-                for attempt in range(1, 4):
-                    await email_input.fill("")
-                    await page.wait_for_timeout(200)
-                    await email_input.fill(ORACLE_EMAIL)
-                    print(f"[{ts()}]   Entered email: {ORACLE_EMAIL} (Attempt {attempt}/3)")
-                    await page.wait_for_timeout(500)
-
-                    next_btn = page.locator('input[type="submit"], #idSIButton9').first
-                    await next_btn.click()
-                    print(f"[{ts()}]   Clicked Next")
-                    await page.wait_for_timeout(3000)
-
-                    try:
-                        await check_for_sso_errors(page)
-                        email_filled = True
-                        break
-                    except RuntimeError as e:
-                        if attempt == 3:
-                            raise
-                        print(f"[{ts()}]   {e} - Retrying...")
-
-                if email_filled:
-                    break
-        except RuntimeError:
-            raise
+            pw_loc = page.locator('input[name="passwd"], input[id="i0118"]')
+            if await pw_loc.first.is_visible(timeout=3000):
+                print(f"[{ts()}]   Password screen detected directly — skipping email entry.")
+                email_filled = True
         except Exception:
-            continue
+            pass
+
+    # ── Step 1: Email ─────────────────────────────────────────────────────
+    if not email_filled:
+        email_selectors = [
+            'input[name="loginfmt"]',
+            'input[type="email"]',
+            'input[id="i0116"]',
+        ]
+        for sel in email_selectors:
+            try:
+                email_input = page.locator(sel).first
+                if await email_input.is_visible(timeout=5000):
+                    for attempt in range(1, 4):
+                        await email_input.click()
+                        await email_input.fill("")
+                        await page.wait_for_timeout(200)
+                        await email_input.type(ORACLE_EMAIL.strip(), delay=50)
+                        print(f"[{ts()}]   Entered email (Attempt {attempt}/3)")
+                        await page.wait_for_timeout(500)
+
+                        next_btn = page.locator('input[type="submit"], #idSIButton9').first
+                        await next_btn.click()
+                        print(f"[{ts()}]   Clicked Next")
+                        await page.wait_for_timeout(3000)
+
+                        try:
+                            await check_for_sso_errors(page)
+                            email_filled = True
+                            break
+                        except RuntimeError as e:
+                            if attempt == 3:
+                                raise
+                            print(f"[{ts()}]   {e} - Retrying...")
+
+                    if email_filled:
+                        break
+            except RuntimeError:
+                raise
+            except Exception:
+                continue
 
     if not email_filled:
         print(f"[{ts()}]   Email field not found — page may have changed.")
@@ -217,9 +235,10 @@ async def _handle_microsoft_sso(page):
             pw_input = page.locator(sel).first
             if await pw_input.is_visible(timeout=5000):
                 for attempt in range(1, 4):
+                    await pw_input.click()
                     await pw_input.fill("")
                     await page.wait_for_timeout(200)
-                    await pw_input.fill(ORACLE_PASSWORD)
+                    await pw_input.type(ORACLE_PASSWORD.strip(), delay=50)
                     print(f"[{ts()}]   Entered password (Attempt {attempt}/3)")
                     await page.wait_for_timeout(500)
 
