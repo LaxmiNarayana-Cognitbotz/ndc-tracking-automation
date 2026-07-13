@@ -1,23 +1,4 @@
-# =============================================================================
-#  NDC & F&F Pipeline - Task Scheduler Setup
-#  Run this ONCE on any machine to register the daily scheduled tasks.
-#
-#  HOW TO RUN (on the client machine):
-#  ─────────────────────────────────────────────────────────────────────────────
-#  1. Open PowerShell or CMD (no Administrator needed)
-#  2. cd into the project folder, e.g.:
-#       cd "D:\Projects\NDC-Tracking-Automation"
-#  3. Run:
-#       powershell -ExecutionPolicy Bypass -File scheduler\setup_scheduler.ps1
-#  ─────────────────────────────────────────────────────────────────────────────
-#  After running, tasks fire silently every day at:
-#    - NDC Report (10:00, 13:00, 16:00, 19:00)
-#    - F&F Report (10:15, 13:15, 16:15, 19:15)
-#  If the PC was OFF/asleep at trigger time, task runs automatically on next boot.
-#
-#  TO UNINSTALL:
-#       powershell -ExecutionPolicy Bypass -File scheduler\setup_scheduler.ps1 -Uninstall
-# =============================================================================
+# Setup scheduled tasks for NDC and F&F pipelines
 
 param(
     [switch]$Uninstall
@@ -29,9 +10,52 @@ $PYTHONW  = Join-Path $ROOT ".venv\Scripts\pythonw.exe"
 $NDC_SCRIPT = Join-Path $ROOT "scheduler\run_pipeline.py"
 $FNF_SCRIPT = Join-Path $ROOT "scripts\process_fnf_closed_reports.py"
 
-$ndcTaskNames = @("NDC_Pipeline_1000", "NDC_Pipeline_1300", "NDC_Pipeline_1600", "NDC_Pipeline_1900")
-$fnfTaskNames = @("FNF_Pipeline_1015", "FNF_Pipeline_1315", "FNF_Pipeline_1615", "FNF_Pipeline_1915")
+$ndcTaskNames = @("NDC_Pipeline_1000", "NDC_Pipeline_1400", "NDC_Pipeline_1800")
+$fnfTaskNames = @("FNF_Pipeline_1115", "FNF_Pipeline_1630")
 $allTaskNames = $ndcTaskNames + $fnfTaskNames
+
+# Helper function to dynamically uninstall tasks matching a pattern
+function Remove-PipelineTasks {
+    param(
+        [string]$Pattern,
+        [string[]]$FallbackNames,
+        [switch]$ShowSkip
+    )
+    
+    $foundTasks = Get-ScheduledTask -TaskName $Pattern -ErrorAction SilentlyContinue
+    
+    $tasksToRemove = @()
+    if ($foundTasks) {
+        foreach ($t in $foundTasks) {
+            $tasksToRemove += $t.TaskName
+        }
+    }
+    
+    foreach ($name in $FallbackNames) {
+        if ($tasksToRemove -notcontains $name) {
+            $tasksToRemove += $name
+        }
+    }
+    
+    foreach ($name in $tasksToRemove) {
+        try {
+            $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+            if ($task) {
+                if ($task.State -eq "Running") {
+                    Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+                }
+                Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop
+                Write-Host "  [OK] Removed: $name" -ForegroundColor Green
+            } elseif ($ShowSkip) {
+                Write-Host "  [SKIP] Not found: $name" -ForegroundColor Gray
+            }
+        } catch {
+            if ($task -or ($FallbackNames -contains $name)) {
+                Write-Host "  [FAIL] $name : $_" -ForegroundColor Red
+            }
+        }
+    }
+}
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
@@ -45,22 +69,7 @@ Write-Host ""
 # ── Uninstall mode ────────────────────────────────────────────────────────────
 if ($Uninstall) {
     Write-Host "Uninstalling all pipeline tasks..." -ForegroundColor Yellow
-    foreach ($name in $allTaskNames) {
-        try {
-            $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-            if ($task) {
-                if ($task.State -eq "Running") {
-                    Stop-ScheduledTask -TaskName $name
-                }
-                Unregister-ScheduledTask -TaskName $name -Confirm:$false
-                Write-Host "  [OK] Removed: $name" -ForegroundColor Green
-            } else {
-                Write-Host "  [SKIP] Not found: $name" -ForegroundColor Gray
-            }
-        } catch {
-            Write-Host "  [FAIL] $name : $_" -ForegroundColor Red
-        }
-    }
+    Remove-PipelineTasks -Pattern "*_Pipeline_*" -FallbackNames $allTaskNames -ShowSkip
     Write-Host ""
     exit 0
 }
@@ -76,6 +85,11 @@ if (-not (Test-Path $PYTHONW)) {
     Write-Host ""
     exit 1
 }
+
+# Automatically clean up any existing tasks matching the pattern first
+Write-Host "Cleaning up any existing pipeline tasks first..." -ForegroundColor Yellow
+Remove-PipelineTasks -Pattern "*_Pipeline_*" -FallbackNames $allTaskNames
+Write-Host ""
 
 # ── Task configuration ────────────────────────────────────────────────────────
 $settings = New-ScheduledTaskSettingsSet `
@@ -98,16 +112,13 @@ $fnfAction = New-ScheduledTaskAction `
 
 $ndcTasks = @(
     @{ Name = "NDC_Pipeline_1000"; Time = "10:00" },
-    @{ Name = "NDC_Pipeline_1300"; Time = "13:00" },
-    @{ Name = "NDC_Pipeline_1600"; Time = "16:00" },
-    @{ Name = "NDC_Pipeline_1900"; Time = "19:00" }
+    @{ Name = "NDC_Pipeline_1400"; Time = "14:00" },
+    @{ Name = "NDC_Pipeline_1800"; Time = "18:00" }
 )
 
 $fnfTasks = @(
-    @{ Name = "FNF_Pipeline_1015"; Time = "10:15" },
-    @{ Name = "FNF_Pipeline_1315"; Time = "13:15" },
-    @{ Name = "FNF_Pipeline_1615"; Time = "16:15" },
-    @{ Name = "FNF_Pipeline_1915"; Time = "19:15" }
+    @{ Name = "FNF_Pipeline_1115"; Time = "11:15" },
+    @{ Name = "FNF_Pipeline_1630"; Time = "16:30" }
 )
 
 # ── Register tasks ────────────────────────────────────────────────────────────
@@ -155,8 +166,8 @@ if ($failed -eq 0) {
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host "  SUCCESS! All tasks registered." -ForegroundColor Green
     Write-Host ""
-    Write-Host "  NDC Runs silently at: 10:00 | 13:00 | 16:00 | 19:00" -ForegroundColor Green
-    Write-Host "  F&F Runs silently at: 10:15 | 13:15 | 16:15 | 19:15" -ForegroundColor Green
+    Write-Host "  NDC Runs silently at: 10:00 | 14:00 | 18:00" -ForegroundColor Green
+    Write-Host "  F&F Runs silently at: 11:15 | 16:30" -ForegroundColor Green
     Write-Host "  Missed triggers fire automatically on next boot/wake." -ForegroundColor Green
     Write-Host ""
     Write-Host "  Commands:" -ForegroundColor Gray
