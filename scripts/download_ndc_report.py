@@ -4,6 +4,7 @@ Oracle Fusion - NDC Process Request Status Report Downloader
 
 import asyncio
 import os
+import subprocess
 import sys
 import traceback
 from datetime import datetime
@@ -13,6 +14,19 @@ import pandas as pd
 from dotenv import load_dotenv
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
+
+# ── Suppress Chrome subprocess window on Windows ────────────────────────────
+if sys.platform == "win32":
+    _original_popen_init = subprocess.Popen.__init__
+
+    def _patched_popen_init(self, *args, **kwargs):
+        if "creationflags" not in kwargs:
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            kwargs["creationflags"] |= subprocess.CREATE_NO_WINDOW
+        _original_popen_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _patched_popen_init
 
 # Redirect stdout and stderr to a log file
 LOG_DIR = Path(__file__).parent.parent / "logs"
@@ -98,7 +112,9 @@ def _cleanup_profile_locks():
 
 
 async def save_debug_screenshot(page, label: str):
-    path = DOWNLOAD_DIR / f"debug_{label}_{datetime.now().strftime('%H%M%S')}.png"
+    error_dir = Path(__file__).parent.parent / "errors" / "ndc_error"
+    error_dir.mkdir(parents=True, exist_ok=True)
+    path = error_dir / f"debug_{label}_{datetime.now().strftime('%H%M%S')}.png"
     try:
         await page.screenshot(path=str(path), full_page=True)
         print(f"[{ts()}]   Screenshot: {path}")
@@ -152,6 +168,83 @@ async def _handle_microsoft_sso(page):
     print(f"[{ts()}] SSO login detected — filling credentials automatically...")
     await page.wait_for_timeout(2000)
     await check_for_sso_errors(page)
+
+    # ── Handle "Pick an account" page ────────────────────────────────────
+    # Microsoft shows this when one or more accounts are already signed in.
+    try:
+        pick_account_header = page.locator('div#loginHeader:has-text("Pick an account"), div:has-text("Pick an account")')
+        if await pick_account_header.first.is_visible(timeout=5000):
+            print(f"[{ts()}]   'Pick an account' page detected.")
+            await page.wait_for_timeout(1000)
+
+            # Find the account tile that contains the ORACLE_EMAIL
+            target_email = ORACLE_EMAIL.strip().lower()
+            account_found = False
+
+            # Microsoft lists accounts as clickable divs/buttons with the email text
+            account_selectors = [
+                'div.table[role="button"]',
+                'div[data-test-id]',
+                'div.row.tile',
+                'li.table',
+            ]
+
+            for sel in account_selectors:
+                try:
+                    accounts = page.locator(sel)
+                    count = await accounts.count()
+                    for i in range(count):
+                        tile = accounts.nth(i)
+                        tile_text = (await tile.inner_text()).strip().lower()
+                        if target_email in tile_text:
+                            print(f"[{ts()}]   Found matching account: {ORACLE_EMAIL}")
+                            await tile.click()
+                            account_found = True
+                            break
+                    if account_found:
+                        break
+                except Exception:
+                    continue
+
+            # Fallback: try locating by small text elements containing the email
+            if not account_found:
+                try:
+                    email_text_loc = page.locator(f'small:has-text("{ORACLE_EMAIL}"), div:has-text("{ORACLE_EMAIL}")')
+                    count = await email_text_loc.count()
+                    for i in range(count):
+                        el = email_text_loc.nth(i)
+                        if await el.is_visible(timeout=2000):
+                            # Click the parent tile/row
+                            parent = el.locator('xpath=ancestor::div[@role="button" or contains(@class,"table") or contains(@class,"tile")]').first
+                            if await parent.count() > 0:
+                                await parent.click()
+                            else:
+                                await el.click()
+                            account_found = True
+                            print(f"[{ts()}]   Clicked account tile via email text match: {ORACLE_EMAIL}")
+                            break
+                except Exception:
+                    pass
+
+            if not account_found:
+                # Last resort: click "Use another account" and proceed with full email+password flow
+                try:
+                    use_another = page.locator('div#otherTile, div:has-text("Use another account")').last
+                    if await use_another.is_visible(timeout=3000):
+                        await use_another.click()
+                        print(f"[{ts()}]   Account not found in list — clicked 'Use another account'")
+                except Exception:
+                    print(f"[{ts()}]   Could not find matching account or 'Use another account' button")
+
+            await page.wait_for_timeout(3000)
+    except Exception:
+        pass  # Not a "Pick an account" page — continue with normal flow
+
+    # ── Check if SSO completed after account pick (session reused) ───────
+    current_url_after = page.url.lower()
+    if not any(x in current_url_after for x in ["login.microsoftonline", "login.microsoft", "adfs", "saml"]):
+        print(f"[{ts()}]   SSO completed after account selection — no further login needed.")
+        return True
 
     # ── Wait for SSO page to stabilise before touching any input ─────────
     email_filled = False
@@ -767,18 +860,24 @@ async def download_ndc_report():
     try:
         async with async_playwright() as p:
             print(f"[{ts()}] Launching browser...")
+            # Build Chrome arguments
+            chrome_args = [
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-session-crashed-bubble",
+                "--hide-crash-restore-bubble",
+                "--window-size=1517,900",
+                "--window-position=-32000,-32000",
+            ]
+            is_headless = HEADLESS == "true"
+            
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=str(AUTOMATION_PROFILE_DIR),
-                channel="chrome",
-                headless=(HEADLESS == "true"),
-                args=[
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-session-crashed-bubble",
-                    "--hide-crash-restore-bubble",
-                    "--window-size=1517,900",
-                ]
+                # channel="chrome",
+                headless=is_headless,
+                viewport={"width": 1517, "height": 900},
+                args=chrome_args,
             )
 
 
